@@ -6,6 +6,14 @@ import (
 	"fmt"
 	"io/ioutil"
 	"net/http"
+
+	"github.com/newrelic/go-agent/v3/newrelic"
+)
+
+var (
+	client = &http.Client{
+		Transport: newrelic.NewRoundTripper(nil),
+	}
 )
 
 const (
@@ -148,7 +156,7 @@ func APIShipmentRequest(shipmentURL string, param *APIShipmentRequestReq) ([]byt
 	return ioutil.ReadAll(res.Body)
 }
 
-func APIShipmentStatus(shipmentURL string, param *APIShipmentStatusReq) (*APIShipmentStatusRes, error) {
+func APIShipmentStatus(shipmentURL string, param *APIShipmentStatusReq, r *http.Request) (*APIShipmentStatusRes, error) {
 	b, _ := json.Marshal(param)
 
 	req, err := http.NewRequest(http.MethodGet, shipmentURL+"/status", bytes.NewBuffer(b))
@@ -160,7 +168,11 @@ func APIShipmentStatus(shipmentURL string, param *APIShipmentStatusReq) (*APIShi
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", IsucariAPIToken)
 
-	res, err := http.DefaultClient.Do(req)
+	txn := newrelic.FromContext(r.Context())
+	req = newrelic.RequestWithTransactionContext(req, txn)
+
+	res, err := client.Do(req)
+
 	if err != nil {
 		return nil, err
 	}
