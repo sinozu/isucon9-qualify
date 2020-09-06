@@ -14,6 +14,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"sync"
 	"time"
 
 	_ "github.com/go-sql-driver/mysql"
@@ -135,6 +136,7 @@ type ItemDetail struct {
 	TransactionEvidenceStatus string      `json:"transaction_evidence_status,omitempty"`
 	ShippingStatus            string      `json:"shipping_status,omitempty"`
 	CreatedAt                 int64       `json:"created_at"`
+	ReserveID                 string      `json:"-"`
 }
 
 type TransactionEvidence struct {
@@ -150,6 +152,7 @@ type TransactionEvidence struct {
 	ItemRootCategoryID int       `json:"item_root_category_id" db:"item_root_category_id"`
 	CreatedAt          time.Time `json:"-" db:"created_at"`
 	UpdatedAt          time.Time `json:"-" db:"updated_at"`
+	ReserveID          string    `json:"-" db:"reserve_id"`
 }
 
 type Shipping struct {
@@ -931,6 +934,7 @@ func getTransactions(w http.ResponseWriter, r *http.Request) {
 	}
 
 	itemDetails := []ItemDetail{}
+
 	for _, item := range items {
 		seller, err := getUserSimpleByID(tx, item.SellerID)
 		if err != nil {
@@ -976,46 +980,59 @@ func getTransactions(w http.ResponseWriter, r *http.Request) {
 		}
 
 		transactionEvidence := TransactionEvidence{}
-		err = tx.Get(&transactionEvidence, "SELECT * FROM `transaction_evidences` WHERE `item_id` = ?", item.ID)
+		err = tx.Get(&transactionEvidence, "SELECT t.id, t.status, s.reserve_id FROM transaction_evidences AS t LEFT JOIN shippings AS s ON s.transaction_evidence_id = t.id WHERE t.item_id = ?", item.ID)
 		if err != nil && err != sql.ErrNoRows {
 			// It's able to ignore ErrNoRows
 			log.Print(err)
-			outputErrorMsg(w, http.StatusInternalServerError, "db error")
+			outputErrorMsg(w, http.StatusInternalServerError, "db error11111")
 			tx.Rollback()
 			return
 		}
 
 		if transactionEvidence.ID > 0 {
-			shipping := Shipping{}
-			err = tx.Get(&shipping, "SELECT * FROM `shippings` WHERE `transaction_evidence_id` = ?", transactionEvidence.ID)
-			if err == sql.ErrNoRows {
-				outputErrorMsg(w, http.StatusNotFound, "shipping not found")
-				tx.Rollback()
-				return
-			}
-			if err != nil {
-				log.Print(err)
-				outputErrorMsg(w, http.StatusInternalServerError, "db error")
-				tx.Rollback()
-				return
-			}
-			ssr, err := APIShipmentStatus(getShipmentServiceURL(), &APIShipmentStatusReq{
-				ReserveID: shipping.ReserveID,
-			}, r)
-			if err != nil {
-				log.Print(err)
-				outputErrorMsg(w, http.StatusInternalServerError, "failed to request to shipment service")
-				tx.Rollback()
-				return
-			}
-
 			itemDetail.TransactionEvidenceID = transactionEvidence.ID
 			itemDetail.TransactionEvidenceStatus = transactionEvidence.Status
-			itemDetail.ShippingStatus = ssr.Status
+			itemDetail.ReserveID = transactionEvidence.ReserveID
+
 		}
 
 		itemDetails = append(itemDetails, itemDetail)
 	}
+
+	var wg sync.WaitGroup
+	var shipmentStatuses sync.Map
+	for _, item := range itemDetails {
+		if item.TransactionEvidenceID > 0 {
+			wg.Add(1)
+			go func(tx *sqlx.Tx, i ItemDetail) {
+				defer wg.Done()
+				ssr, err := APIShipmentStatus(getShipmentServiceURL(), &APIShipmentStatusReq{
+					ReserveID: i.ReserveID,
+				}, r)
+				if err != nil {
+					log.Print(err)
+					outputErrorMsg(w, http.StatusInternalServerError, "failed to request to shipment service")
+					tx.Rollback()
+					return
+				}
+				shipmentStatuses.Store(i.ID, ssr)
+			}(tx, item)
+		}
+	}
+	wg.Wait()
+
+	tmpItemDetails := []ItemDetail{}
+	for _, item := range itemDetails {
+		ssr, ok := shipmentStatuses.Load(item.ID)
+		if !ok {
+			continue
+		}
+		item.ShippingStatus = ssr.(*APIShipmentStatusRes).Status
+		tmpItemDetails = append(tmpItemDetails, item)
+	}
+
+	itemDetails = tmpItemDetails
+
 	tx.Commit()
 
 	hasNext := false
