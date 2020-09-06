@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	crand "crypto/rand"
 	"database/sql"
 	"encoding/json"
@@ -21,6 +22,9 @@ import (
 	goji "goji.io"
 	"goji.io/pat"
 	"golang.org/x/crypto/bcrypt"
+
+	_ "github.com/newrelic/go-agent/v3/integrations/nrmysql"
+	"github.com/newrelic/go-agent/v3/newrelic"
 )
 
 const (
@@ -63,6 +67,7 @@ var (
 	templates *template.Template
 	dbx       *sqlx.DB
 	store     sessions.Store
+	app       *newrelic.Application
 )
 
 type Config struct {
@@ -276,6 +281,13 @@ func init() {
 	templates = template.Must(template.ParseFiles(
 		"../public/index.html",
 	))
+
+	app, _ = newrelic.NewApplication(
+		newrelic.ConfigAppName("isucon9-qualify-uo"),
+		newrelic.ConfigLicense(os.Getenv("NEW_RELIC_LICENSE_KEY")),
+		newrelic.ConfigDistributedTracerEnabled(true),
+		newrelic.ConfigDebugLogger(os.Stdout),
+	)
 }
 
 func main() {
@@ -313,13 +325,14 @@ func main() {
 		dbname,
 	)
 
-	dbx, err = sqlx.Open("mysql", dsn)
+	dbx, err = sqlx.Open("nrmysql", dsn)
 	if err != nil {
 		log.Fatalf("failed to connect to DB: %s.", err.Error())
 	}
 	defer dbx.Close()
 
 	mux := goji.NewMux()
+	mux.Use(nrt)
 
 	// API
 	mux.HandleFunc(pat.Post("/initialize"), postInitialize)
@@ -382,8 +395,10 @@ func getUser(r *http.Request) (user User, errCode int, errMsg string) {
 	if !ok {
 		return user, http.StatusNotFound, "no session"
 	}
-
-	err := dbx.Get(&user, "SELECT * FROM `users` WHERE `id` = ?", userID)
+	ctx := r.Context()
+	// txn := newrelic.FromContext(r.Context())
+	// ctx := newrelic.NewContext(context.Background(), txn)
+	err := dbx.GetContext(ctx, &user, "SELECT * FROM `users` WHERE `id` = ?", userID)
 	if err == sql.ErrNoRows {
 		return user, http.StatusNotFound, "user not found"
 	}
@@ -407,10 +422,13 @@ func getUserSimpleByID(q sqlx.Queryer, userID int64) (userSimple UserSimple, err
 	return userSimple, err
 }
 
-func getCategoryByID(q sqlx.Queryer, categoryID int) (category Category, err error) {
-	err = sqlx.Get(q, &category, "SELECT * FROM `categories` WHERE `id` = ?", categoryID)
+func getCategoryByID(q sqlx.Queryer, categoryID int, r *http.Request) (category Category, err error) {
+	// ctx := r.Context()
+	txn := newrelic.FromContext(r.Context())
+	ctx := newrelic.NewContext(context.Background(), txn)
+	err = dbx.GetContext(ctx, &category, "SELECT * FROM `categories` WHERE `id` = ?", categoryID)
 	if category.ParentID != 0 {
-		parentCategory, err := getCategoryByID(q, category.ParentID)
+		parentCategory, err := getCategoryByID(q, category.ParentID, r)
 		if err != nil {
 			return category, err
 		}
@@ -564,7 +582,7 @@ func getNewItems(w http.ResponseWriter, r *http.Request) {
 			outputErrorMsg(w, http.StatusNotFound, "seller not found")
 			return
 		}
-		category, err := getCategoryByID(dbx, item.CategoryID)
+		category, err := getCategoryByID(dbx, item.CategoryID, r)
 		if err != nil {
 			outputErrorMsg(w, http.StatusNotFound, "category not found")
 			return
@@ -606,7 +624,7 @@ func getNewCategoryItems(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	rootCategory, err := getCategoryByID(dbx, rootCategoryID)
+	rootCategory, err := getCategoryByID(dbx, rootCategoryID, r)
 	if err != nil || rootCategory.ParentID != 0 {
 		outputErrorMsg(w, http.StatusNotFound, "category not found")
 		return
@@ -692,7 +710,7 @@ func getNewCategoryItems(w http.ResponseWriter, r *http.Request) {
 			outputErrorMsg(w, http.StatusNotFound, "seller not found")
 			return
 		}
-		category, err := getCategoryByID(dbx, item.CategoryID)
+		category, err := getCategoryByID(dbx, item.CategoryID, r)
 		if err != nil {
 			outputErrorMsg(w, http.StatusNotFound, "category not found")
 			return
@@ -802,7 +820,7 @@ func getUserItems(w http.ResponseWriter, r *http.Request) {
 
 	itemSimples := []ItemSimple{}
 	for _, item := range items {
-		category, err := getCategoryByID(dbx, item.CategoryID)
+		category, err := getCategoryByID(dbx, item.CategoryID, r)
 		if err != nil {
 			outputErrorMsg(w, http.StatusNotFound, "category not found")
 			return
@@ -920,7 +938,7 @@ func getTransactions(w http.ResponseWriter, r *http.Request) {
 			tx.Rollback()
 			return
 		}
-		category, err := getCategoryByID(tx, item.CategoryID)
+		category, err := getCategoryByID(tx, item.CategoryID, r)
 		if err != nil {
 			outputErrorMsg(w, http.StatusNotFound, "category not found")
 			tx.Rollback()
@@ -983,7 +1001,7 @@ func getTransactions(w http.ResponseWriter, r *http.Request) {
 			}
 			ssr, err := APIShipmentStatus(getShipmentServiceURL(), &APIShipmentStatusReq{
 				ReserveID: shipping.ReserveID,
-			})
+			}, r)
 			if err != nil {
 				log.Print(err)
 				outputErrorMsg(w, http.StatusInternalServerError, "failed to request to shipment service")
@@ -1042,7 +1060,7 @@ func getItem(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	category, err := getCategoryByID(dbx, item.CategoryID)
+	category, err := getCategoryByID(dbx, item.CategoryID, r)
 	if err != nil {
 		outputErrorMsg(w, http.StatusNotFound, "category not found")
 		return
@@ -1330,7 +1348,7 @@ func postBuy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	category, err := getCategoryByID(tx, targetItem.CategoryID)
+	category, err := getCategoryByID(tx, targetItem.CategoryID, r)
 	if err != nil {
 		log.Print(err)
 
@@ -1684,7 +1702,7 @@ func postShipDone(w http.ResponseWriter, r *http.Request) {
 
 	ssr, err := APIShipmentStatus(getShipmentServiceURL(), &APIShipmentStatusReq{
 		ReserveID: shipping.ReserveID,
-	})
+	}, r)
 	if err != nil {
 		log.Print(err)
 		outputErrorMsg(w, http.StatusInternalServerError, "failed to request to shipment service")
@@ -1824,7 +1842,7 @@ func postComplete(w http.ResponseWriter, r *http.Request) {
 
 	ssr, err := APIShipmentStatus(getShipmentServiceURL(), &APIShipmentStatusReq{
 		ReserveID: shipping.ReserveID,
-	})
+	}, r)
 	if err != nil {
 		log.Print(err)
 		outputErrorMsg(w, http.StatusInternalServerError, "failed to request to shipment service")
@@ -1928,7 +1946,7 @@ func postSell(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	category, err := getCategoryByID(dbx, categoryID)
+	category, err := getCategoryByID(dbx, categoryID, r)
 	if err != nil || category.ParentID == 0 {
 		log.Print(categoryID, category)
 		outputErrorMsg(w, http.StatusBadRequest, "Incorrect category ID")
@@ -2314,4 +2332,18 @@ func outputErrorMsg(w http.ResponseWriter, status int, msg string) {
 
 func getImageURL(imageName string) string {
 	return fmt.Sprintf("/upload/%s", imageName)
+}
+
+// Middleware to create/end NewRelic transaction
+func nrt(inner http.Handler) http.Handler {
+	mw := func(w http.ResponseWriter, r *http.Request) {
+		txn := app.StartTransaction(r.URL.Path)
+		defer txn.End()
+
+		r = newrelic.RequestWithTransactionContext(r, txn)
+		txn.SetWebRequestHTTP(r)
+		w = txn.SetWebResponse(w)
+		inner.ServeHTTP(w, r)
+	}
+	return http.HandlerFunc(mw)
 }
